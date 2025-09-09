@@ -91,3 +91,100 @@ df_meta = pd.DataFrame(rows).sort_values(
 
 # Ausgabe des DataFrames (zeigt zunächst nur Pfad und Zeitstempel)
 df_meta
+
+
+
+# Zelle 2 – Installation & Umgebungscheck (TensorFlow/Keras)
+
+# Installiert in den AKTUELLEN Jupyter-Kernel (wichtig in VS Code).
+%pip install --quiet tensorflow tensorflow-hub pillow pandas matplotlib scikit-learn opencv-python
+
+# Minimaler Import- und Versionscheck
+import sys, platform
+import tensorflow as tf
+import tensorflow_hub as hub
+import PIL, pandas as pd, matplotlib, sklearn
+import cv2
+
+print(f"Python:        {sys.version.split()[0]}  on {platform.system()} {platform.release()}")
+print(f"TensorFlow:    {tf.__version__}")
+print(f"TF Hub:        {hub.__version__}")
+print(f"Pillow:        {PIL.__version__}")
+print(f"pandas:        {pd.__version__}")
+print(f"matplotlib:    {matplotlib.__version__}")
+print(f"scikit-learn:  {sklearn.__version__}")
+print(f"OpenCV:        {cv2.__version__}")
+
+# Geräte-Check (GPU/CPU)
+gpus = tf.config.list_physical_devices('GPU')
+print(f"Gefundene GPUs: {len(gpus)}")
+for i, g in enumerate(gpus):
+    print(f"  GPU[{i}]: {g.name}")
+
+# Kurzer Sanity-Check einer kleinen TensorFlow-Operation
+x = tf.constant([[1.0, 2.0],[3.0, 4.0]])
+y = tf.reduce_mean(x)
+print("TF Test (Mean):", y.numpy())
+
+
+
+
+# Zelle 3 – Imports, Seeds, Gerätecheck, Pfade, Hyperparameter (TensorFlow/Keras)
+
+from pathlib import Path
+import os, sys, platform, random
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
+# Reproduzierbarkeit: feste Seeds
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+try:
+    # Ab TF 2.9 verfügbar; macht einige Operationen deterministischer
+    tf.config.experimental.enable_op_determinism(True)
+except Exception:
+    pass
+
+# Geräte- und Umgebungsinfo
+gpus = tf.config.list_physical_devices('GPU')
+print(f"Python {sys.version.split()[0]} auf {platform.system()} {platform.release()}")
+print(f"TensorFlow {tf.__version__} | GPUs erkannt: {len(gpus)}")
+for i, g in enumerate(gpus):
+    print(f"  GPU[{i}]: {g.name}")
+
+# Pfade: passe diese drei Pfade an deine Struktur an
+# IMG_DIR: freier Ordner für ad-hoc Sichtung (hast du in Zelle 4 bereits genutzt)
+# DATA_ROOT: Wurzel für Transfer Learning mit splits: data/train/<Klasse>, data/val/<Klasse>, optional data/test/<Klasse>
+IMG_DIR   = Path(r"C:\Pfad\zu\deinen\Bildern")
+DATA_ROOT = Path(r"C:\Pfad\zu\data")
+TRAIN_DIR = DATA_ROOT / "train"
+VAL_DIR   = DATA_ROOT / "val"
+TEST_DIR  = DATA_ROOT / "test"   # optional, kann fehlen
+
+# Hyperparameter und Konstanten
+IMG_SIZE          = (224, 224)      # für MobileNet/EfficientNet-B0 ausreichend; später ggf. erhöhen
+BATCH_SIZE_TRAIN  = 32              # auf CPU ggf. auf 16 reduzieren, wenn RAM knapp ist
+BATCH_SIZE_VAL    = 32
+EPOCHS_HEAD       = 10              # nur Klassifikationskopf
+EPOCHS_FINE       = 10              # selektives Fine-Tuning
+LR_HEAD           = 1e-3            # Lernrate für Kopf-Training
+LR_FINE           = 1e-5            # kleinere Lernrate fürs Fine-Tuning
+LABEL_SMOOTHING   = 0.0             # bei starker Imbalance ggf. 0.05–0.1
+AUTOTUNE          = tf.data.AUTOTUNE
+NUM_CLASSES       = None            # wird später aus dem Dataset inferiert
+
+# Dateiendungen für die freie Sichtung (Zelle 4) und Metadaten (Zelle 5)
+EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+# Kurzer Sanity-Print der wichtigsten Einstellungen
+print("\nKonfiguration:")
+print(f"  IMG_DIR:   {IMG_DIR}")
+print(f"  DATA_ROOT: {DATA_ROOT}")
+print(f"  TRAIN_DIR: {TRAIN_DIR}")
+print(f"  VAL_DIR:   {VAL_DIR}  | TEST_DIR: {TEST_DIR} (optional)")
+print(f"  IMG_SIZE:  {IMG_SIZE} | BATCH_TRAIN: {BATCH_SIZE_TRAIN} | BATCH_VAL: {BATCH_SIZE_VAL}")
+print(f"  EPOCHS_HEAD: {EPOCHS_HEAD} | EPOCHS_FINE: {EPOCHS_FINE}")
+print(f"  LR_HEAD: {LR_HEAD} | LR_FINE: {LR_FINE} | Label Smoothing: {LABEL_SMOOTHING}")
