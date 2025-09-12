@@ -191,49 +191,48 @@ print(f"  LR_HEAD: {LR_HEAD} | LR_FINE: {LR_FINE} | Label Smoothing: {LABEL_SMOO
 
 
 # %% [markdown]
-# 🧩 Batch-Video-Cropping direkt per pip (ohne externes ffmpeg)
-# Anleitung: Pfade und Parameter unten anpassen und Zelle ausführen.
-# Benötigt nur: pip install opencv-python tqdm
+# 🧩 Lokales Video-Cropping mit minimalem Qualitätsverlust (nur pip: av, numpy, tqdm)
+# - Qualitätsmodi: "lossless_ffv1" (MKV, wirklich verlustfrei), "lossless_h264" (CRF 0), "visually_lossless_h264"
+# - Audio standardmäßig verlustfrei als PCM (groß, aber sicher). Optional AAC aktivierbar.
+# - Alles lokal, keine externen Tools nötig.
 
 # %%
-# Abhängigkeiten installieren (funktioniert in Jupyter und VS Code)
 import sys, subprocess, pkgutil
 def _pip_install(pkg):
     if pkg not in {m.name for m in pkgutil.iter_modules()}:
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
-for p in ["opencv-python", "tqdm"]:
+for p in ["av", "numpy", "tqdm"]:
     _pip_install(p)
 
 # %%
-import cv2
 from pathlib import Path
+from typing import Optional, Tuple
+import av
+import numpy as np
 from tqdm import tqdm
 
 # ====================== EINSTELLUNGEN ======================
-INPUT_DIR   = Path("./videos_in")     # Eingangsordner
-OUTPUT_DIR  = Path("./videos_out")    # Ausgabeordner
+INPUT_DIR   = Path("./videos_in")
+OUTPUT_DIR  = Path("./videos_out")
 VIDEO_EXTS  = {".mp4", ".mov", ".mkv", ".m4v", ".avi", ".webm"}
 
 CROP_MODE   = "percent"               # "percent" oder "px"
+CROP_PCT    = dict(left=0.05, right=0.05, top=0.05, bottom=0.05)   # bei percent: Anteile je Seite
+CROP_PX     = dict(left=50, right=50, top=50, bottom=50)           # bei px: Pixel je Seite
 
-# Wenn CROP_MODE == "percent": 0.10 = 10% je Seite
-CROP_PCT = dict(left=0.05, right=0.05, top=0.05, bottom=0.05)
+QUALITY_MODE = "lossless_ffv1"        # "lossless_ffv1" | "lossless_h264" | "visually_lossless_h264"
+VISUAL_CRF   = 10                     # nur für "visually_lossless_h264" (kleiner = bessere Qualität)
+H264_PRESET  = "slow"                 # "ultrafast" ... "veryslow"
 
-# Wenn CROP_MODE == "px": Pixel je Seite
-CROP_PX  = dict(left=50, right=50, top=50, bottom=50)
+AUDIO_MODE   = "pcm_s16le"            # "pcm_s16le" (verlustfrei, groß) | "aac"
+AUDIO_BITRATE = "192k"                # nur falls AAC genutzt wird
 
-# Optional nur eine Vorschau in Sekunden schreiben (None = ganzes Video)
-PREVIEW_SECONDS = None
-
-# Videocodec/FourCC für MP4-Ausgabe (breit kompatibel)
-FOURCC = "mp4v"
-
-# Suffix für Ausgabedateinamen
+PREVIEW_SECONDS: Optional[int] = None # z. B. 5 oder None für komplettes Video
 OUTPUT_SUFFIX = "_cropped"
 # ===========================================================
 
-def _compute_crop(w, h):
+def _compute_crop(w: int, h: int) -> Tuple[int,int,int,int]:
     if CROP_MODE == "percent":
         l = max(0.0, float(CROP_PCT["left"]))
         r = max(0.0, float(CROP_PCT["right"]))
@@ -250,81 +249,136 @@ def _compute_crop(w, h):
         b = max(0, int(CROP_PX["bottom"]))
         cw = w - l - r
         ch = h - t - b
-        cx = l
-        cy = t
+        cx, cy = l, t
     else:
         raise ValueError("CROP_MODE muss 'percent' oder 'px' sein.")
-
-    cw = max(2, cw // 2 * 2)  # gerade Dimensionen helfen bei manchen Playern
+    cw = max(2, cw // 2 * 2)
     ch = max(2, ch // 2 * 2)
-    cx = max(0, min(cx, w - 2))
-    cy = max(0, min(cy, h - 2))
+    cx = max(0, min(cx, max(0, w-2)))
+    cy = max(0, min(cy, max(0, h-2)))
     if cx + cw > w: cw = max(2, (w - cx) // 2 * 2)
     if cy + ch > h: ch = max(2, (h - cy) // 2 * 2)
     return cw, ch, cx, cy
 
-def _safe_fps(cap):
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    return fps if fps and fps > 0 else 30.0
+def _out_params(mode: str):
+    if mode == "lossless_ffv1":
+        container = "mkv"
+        vcodec = "ffv1"
+        vopts  = {"level":"3", "coder":"1", "context":"1", "g":"1"}  # intra, verlustfrei
+        pixfmt = "rgb24"  # wirklich ohne Chroma-Subsampling
+    elif mode == "lossless_h264":
+        container = "mp4"
+        vcodec = "libx264"
+        vopts  = {"crf":"0", "preset":H264_PRESET, "tune":"grain"}
+        pixfmt = "yuv444p"  # 4:4:4 für verlustfreie Pfade
+    elif mode == "visually_lossless_h264":
+        container = "mp4"
+        vcodec = "libx264"
+        vopts  = {"crf":str(VISUAL_CRF), "preset":H264_PRESET, "tune":"film"}
+        pixfmt = "yuv420p"  # maximale Kompatibilität
+    else:
+        raise ValueError("Ungültiger QUALITY_MODE.")
+    return container, vcodec, vopts, pixfmt
 
-def _frame_limit(cap, fps):
-    if PREVIEW_SECONDS is None:
-        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
-    return int(PREVIEW_SECONDS * fps)
+def _audio_params():
+    if AUDIO_MODE == "pcm_s16le":
+        return "pcm_s16le", {"ar":"48000", "ac":"2"}     # 48 kHz, Stereo
+    elif AUDIO_MODE == "aac":
+        return "aac", {"bit_rate":AUDIO_BITRATE}
+    else:
+        raise ValueError("Ungültiger AUDIO_MODE.")
 
-def crop_video_file(inp_path: Path, out_path: Path):
-    cap = cv2.VideoCapture(str(inp_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Konnte {inp_path.name} nicht öffnen.")
+def crop_video(inp_path: Path):
+    with av.open(str(inp_path), mode="r") as in_ctr:
+        v_in = next((s for s in in_ctr.streams if s.type=="video"), None)
+        a_in = next((s for s in in_ctr.streams if s.type=="audio"), None)
+        if v_in is None:
+            raise RuntimeError("Kein Videostream gefunden.")
 
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = _safe_fps(cap)
-    total_frames = _frame_limit(cap, fps)
+        # Zielparameter bestimmen
+        container_ext, vcodec, vopts, pixfmt = _out_params(QUALITY_MODE)
+        out_name = f"{inp_path.stem}{OUTPUT_SUFFIX}.{container_ext}"
+        out_path = OUTPUT_DIR / out_name
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    cw, ch, cx, cy = _compute_crop(w, h)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*FOURCC)
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (cw, ch))
+        # Abspielrate und Crop berechnen
+        rate = float(v_in.average_rate) if v_in.average_rate else 30.0
+        w_in, h_in = v_in.codec_context.width, v_in.codec_context.height
+        cw, ch, cx, cy = _compute_crop(w_in, h_in)
 
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError("VideoWriter konnte nicht geöffnet werden. Prüfe FourCC/Dateiendung.")
+        # Ausgabe-Container anlegen
+        with av.open(str(out_path), mode="w") as out_ctr:
+            v_out = out_ctr.add_stream(vcodec, rate=rate)
+            for k, v in vopts.items():
+                setattr(v_out.codec_context, k, v) if hasattr(v_out.codec_context, k) else v_out.codec_context.options.update({k:v})
+            v_out.pix_fmt = pixfmt
+            v_out.width, v_out.height = cw, ch
+            v_out.time_base = v_in.time_base or av.time_base
 
-    written = 0
-    with tqdm(total=total_frames if total_frames is not None else 0, unit="f", disable=total_frames is None) as bar:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            crop = frame[cy:cy+ch, cx:cx+cw]
-            if crop.shape[1] != cw or crop.shape[0] != ch:
-                break
-            writer.write(crop)
-            written += 1
-            if total_frames is not None:
-                bar.update(1)
-                if written >= total_frames:
-                    break
+            a_out = None
+            if a_in is not None:
+                acodec, aopts = _audio_params()
+                a_out = out_ctr.add_stream(acodec)
+                for k, v in aopts.items():
+                    if hasattr(a_out.codec_context, k):
+                        setattr(a_out.codec_context, k, int(v) if v.isdigit() else v)
+                    else:
+                        a_out.codec_context.options.update({k:v})
 
-    writer.release()
-    cap.release()
-    return w, h, cw, ch, cx, cy, written, fps
+            # Demux/Decode/Process/Encode
+            frames_written = 0
+            limit_pts = None
+            if PREVIEW_SECONDS is not None and v_in.time_base:
+                limit_pts = int(PREVIEW_SECONDS / v_in.time_base)
+
+            # Fortschritt, wenn Framezahl bekannt
+            total_frames = int(v_in.frames) if v_in.frames else 0
+            bar = tqdm(total=total_frames if total_frames>0 and PREVIEW_SECONDS is None else 0,
+                       unit="f", disable=(total_frames==0 or PREVIEW_SECONDS is not None))
+
+            for packet in in_ctr.demux((v_in, a_in) if a_in is not None else (v_in,)):
+                if packet.stream.type == "video":
+                    for frame in packet.decode():
+                        if limit_pts is not None and frame.pts is not None and frame.pts > limit_pts:
+                            break
+                        # in RGB konvertieren, croppen, neues Frame erzeugen
+                        rgb = frame.to_ndarray(format="rgb24")
+                        crop = rgb[cy:cy+ch, cx:cx+cw, :]
+                        vf = av.VideoFrame.from_ndarray(crop, format="rgb24").reformat(width=cw, height=ch, format=pixfmt)
+                        for pkt in v_out.encode(vf):
+                            out_ctr.mux(pkt)
+                        frames_written += 1
+                        if total_frames: bar.update(1)
+                elif a_in is not None and packet.stream.type == "audio":
+                    # Audio decodieren und erneut kodieren (verlustfrei PCM oder AAC)
+                    for afr in packet.decode():
+                        for pkt in a_out.encode(afr):
+                            out_ctr.mux(pkt)
+
+            # Encoder flushen
+            for pkt in v_out.encode(None):
+                out_ctr.mux(pkt)
+            if a_in is not None:
+                for pkt in a_out.encode(None):
+                    out_ctr.mux(pkt)
+
+            if total_frames: bar.close()
+
+    return out_path, (w_in, h_in), (cw, ch, cx, cy), frames_written, rate
 
 def process_folder():
-    videos = [p for p in INPUT_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS and p.is_file()]
-    if not videos:
+    vids = [p for p in INPUT_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS and p.is_file()]
+    if not vids:
         print(f"Keine Videos in {INPUT_DIR.resolve()} gefunden.")
         return
-    print(f"{len(videos)} Datei(en) gefunden. Starte Cropping…\n")
-    for vid in sorted(videos):
-        out_name = f"{vid.stem}{OUTPUT_SUFFIX}.mp4"
-        out_path = OUTPUT_DIR / out_name
+    print(f"{len(vids)} Datei(en) gefunden. Starte Cropping mit QUALITY_MODE='{QUALITY_MODE}' …\n")
+    for v in sorted(vids):
         try:
-            w, h, cw, ch, cx, cy, frames, fps = crop_video_file(vid, out_path)
-            print(f"{vid.name}: {w}x{h} → crop {cw}x{ch}+{cx}+{cy}, {frames} Frames @ {fps:.2f} fps → {out_path.name}")
+            outp, in_sz, crop, frames, fps = crop_video(v)
+            (w,h),(cw,ch,cx,cy) = in_sz, crop
+            print(f"{v.name}: {w}x{h} → crop {cw}x{ch}+{cx}+{cy}, {frames} Frames @ {fps:.2f} fps → {outp.name}")
         except Exception as e:
-            print(f"Übersprungen ({vid.name}): {e}")
+            print(f"Übersprungen ({v.name}): {e}")
     print("\nFertig. Ausgaben liegen in:", OUTPUT_DIR.resolve())
 
 process_folder()
