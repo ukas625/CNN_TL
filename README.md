@@ -188,3 +188,194 @@ print(f"  VAL_DIR:   {VAL_DIR}  | TEST_DIR: {TEST_DIR} (optional)")
 print(f"  IMG_SIZE:  {IMG_SIZE} | BATCH_TRAIN: {BATCH_SIZE_TRAIN} | BATCH_VAL: {BATCH_SIZE_VAL}")
 print(f"  EPOCHS_HEAD: {EPOCHS_HEAD} | EPOCHS_FINE: {EPOCHS_FINE}")
 print(f"  LR_HEAD: {LR_HEAD} | LR_FINE: {LR_FINE} | Label Smoothing: {LABEL_SMOOTHING}")
+
+
+
+# %% [markdown]
+# 🔧 Video-Batch-Crop mit FFmpeg (Jupyter-Zelle)
+# - Stelle sicher, dass FFmpeg installiert ist (https://ffmpeg.org) und in PATH liegt.
+# - Passe die Parameter im Abschnitt "EINSTELLUNGEN" an.
+# - Crop wahlweise in Prozent oder Pixeln.
+# - Audio/Untertitel werden kopiert, Video wird neu enkodiert (libx264, CRF steuerbar).
+
+# %%
+import json
+import math
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Tuple, Optional
+
+# ========== EINSTELLUNGEN ==========
+# Ordner mit Input-Videos und Zielordner
+INPUT_DIR = Path(r"./videos_in")
+OUTPUT_DIR = Path(r"./videos_out")
+
+# Verarbeite diese Endungen
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".m4v", ".avi", ".webm"}
+
+# Crop-Modus: "percent" ODER "px"
+CROP_MODE = "percent"  # "percent" | "px"
+
+# Wenn CROP_MODE == "percent": Anteile je Seite (0.10 = 10%)
+CROP_PCT = {
+    "left":   0.05,
+    "right":  0.05,
+    "top":    0.05,
+    "bottom": 0.05,
+}
+
+# Wenn CROP_MODE == "px": Pixel je Seite
+CROP_PX = {
+    "left":   50,
+    "right":  50,
+    "top":    50,
+    "bottom": 50,
+}
+
+# Enkodierung: Qualität & Geschwindigkeit (nur Video)
+VIDEO_CODEC = "libx264"   # üblich: libx264 oder libx265
+CRF = 18                  # 18–23 ist guter Bereich (kleiner = bessere Qualität/größere Datei)
+PRESET = "medium"         # ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+
+# Optional: nur eine kurze Vorschau jeder Datei rendern (z. B. 3 Sekunden) – gut zum Testen
+PREVIEW_SECONDS: Optional[int] = None  # z. B. 3 oder None für komplettes Video
+
+# Suffix für Ausgabedateien
+OUTPUT_SUFFIX = "_cropped"
+# ===================================
+
+
+def ensure_ffmpeg() -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        raise RuntimeError("FFmpeg/ffprobe nicht gefunden. Bitte installieren und PATH prüfen.")
+
+
+def ffprobe_size(path: Path) -> Tuple[int, int]:
+    """Ermittelt die sichtbare Breite/Höhe (Rotation berücksichtigt)."""
+    cmd = [
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_streams", "-select_streams", "v:0", str(path)
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"ffprobe-Fehler bei {path}: {res.stderr}")
+    data = json.loads(res.stdout)
+    streams = data.get("streams", [])
+    if not streams:
+        raise RuntimeError(f"Keine Videostreams in {path}")
+    s = streams[0]
+    w, h = int(s["width"]), int(s["height"])
+
+    # Rotation berücksichtigen (falls als Tag vorhanden)
+    rotate = 0
+    tags = s.get("tags", {}) or {}
+    if "rotate" in tags:
+        try:
+            rotate = int(tags["rotate"]) % 180
+        except Exception:
+            rotate = 0
+
+    # Manche Container speichern Rotation in side_data_list
+    sdl = s.get("side_data_list", []) or []
+    for item in sdl:
+        if item.get("rotation"):
+            try:
+                if int(item["rotation"]) % 180:
+                    rotate = 90
+            except Exception:
+                pass
+
+    if rotate == 90:
+        w, h = h, w
+    return w, h
+
+
+def compute_crop(w: int, h: int) -> Tuple[int, int, int, int]:
+    """Berechnet crop=w:h:x:y basierend auf Einstellungen."""
+    if CROP_MODE == "percent":
+        l = max(0.0, CROP_PCT["left"])
+        r = max(0.0, CROP_PCT["right"])
+        t = max(0.0, CROP_PCT["top"])
+        b = max(0.0, CROP_PCT["bottom"])
+        cw = int(round(w * (1.0 - l - r)))
+        ch = int(round(h * (1.0 - t - b)))
+        cx = int(round(w * l))
+        cy = int(round(h * t))
+    elif CROP_MODE == "px":
+        l = max(0, int(CROP_PX["left"]))
+        r = max(0, int(CROP_PX["right"]))
+        t = max(0, int(CROP_PX["top"]))
+        b = max(0, int(CROP_PX["bottom"]))
+        cw = w - l - r
+        ch = h - t - b
+        cx = l
+        cy = t
+    else:
+        raise ValueError("CROP_MODE muss 'percent' oder 'px' sein.")
+
+    # Sicherstellen, dass Werte sinnvoll sind und durch 2 teilbar (für einige Codecs hilfreich)
+    cw = max(2, cw // 2 * 2)
+    ch = max(2, ch // 2 * 2)
+    cx = max(0, min(cx, w - 2))
+    cy = max(0, min(cy, h - 2))
+
+    # Wenn die Box außerhalb rutscht, clampen
+    if cx + cw > w:
+        cw = max(2, (w - cx) // 2 * 2)
+    if cy + ch > h:
+        ch = max(2, (h - cy) // 2 * 2)
+
+    return cw, ch, cx, cy
+
+
+def build_ffmpeg_cmd(inp: Path, out: Path, crop: Tuple[int, int, int, int]) -> list:
+    cw, ch, cx, cy = crop
+    vf = f"crop={cw}:{ch}:{cx}:{cy}"
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+
+    if PREVIEW_SECONDS:
+        # Kurzes Snippet ab Sekunde 1; passt die Startzeit bei Bedarf an
+        cmd += ["-ss", "1", "-t", str(PREVIEW_SECONDS)]
+
+    cmd += ["-i", str(inp), "-filter:v", vf,
+            "-c:v", VIDEO_CODEC, "-crf", str(CRF), "-preset", PRESET,
+            "-c:a", "copy", "-c:s", "copy", "-movflags", "+faststart",
+            str(out)]
+    return cmd
+
+
+def process_all():
+    ensure_ffmpeg()
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    videos = [p for p in INPUT_DIR.iterdir() if p.suffix.lower() in VIDEO_EXTS and p.is_file()]
+    if not videos:
+        print(f"Keine Videos in {INPUT_DIR.resolve()} gefunden. Unterstützte Endungen: {sorted(VIDEO_EXTS)}")
+        return
+
+    print(f"{len(videos)} Datei(en) gefunden. Starte Crop…\n")
+
+    for i, vid in enumerate(sorted(videos), 1):
+        try:
+            w, h = ffprobe_size(vid)
+            cw, ch, cx, cy = compute_crop(w, h)
+
+            # Ausgabe als MP4; Dateinamen mit Suffix
+            out_name = f"{vid.stem}{OUTPUT_SUFFIX}.mp4"
+            out_path = OUTPUT_DIR / out_name
+
+            cmd = build_ffmpeg_cmd(vid, out_path, (cw, ch, cx, cy))
+            print(f"[{i}/{len(videos)}] {vid.name}: {w}x{h} -> crop {cw}x{ch}+{cx}+{cy}")
+            subprocess.run(cmd, check=True)
+
+        except subprocess.CalledProcessError as e:
+            print(f"FFmpeg-Fehler bei {vid.name}: {e}")
+        except Exception as e:
+            print(f"Übersprungen ({vid.name}): {e}")
+
+    print("\nFertig. Ausgaben liegen in:", OUTPUT_DIR.resolve())
+
+
+process_all()
